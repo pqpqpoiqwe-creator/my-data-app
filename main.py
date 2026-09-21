@@ -1,8 +1,8 @@
 """
-어제의 박스오피스 - Streamlit 앱
+날짜별 박스오피스 - Streamlit 앱
 --------------------------------
 KOBIS(영화진흥위원회) 오픈API의 '일별 박스오피스' 결과를
-어제 날짜(한국 시간 기준) 기준으로 보여주는 앱입니다.
+달력에서 고른 날짜(최대 어제, 한국 시간 기준) 기준으로 보여주는 앱입니다.
 
 * 인증키는 코드에 직접 쓰지 않고, Streamlit의 secrets(비밀 금고)에서 불러옵니다.
   -> 로컬에서 테스트할 땐 .streamlit/secrets.toml 파일에
@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 # -----------------------------
 # 1. 페이지 기본 설정
 # -----------------------------
-st.set_page_config(page_title="어제의 박스오피스", page_icon="🎬", layout="wide")
+st.set_page_config(page_title="날짜별 박스오피스", page_icon="🎬", layout="wide")
 
 KOBIS_URL = "https://www.kobis.or.kr/kobisopenapi/webservice/rest/boxoffice/searchDailyBoxOfficeList.json"
 
@@ -30,11 +30,12 @@ KOBIS_URL = "https://www.kobis.or.kr/kobisopenapi/webservice/rest/boxoffice/sear
 # 2. '어제' 날짜를 한국 시간(KST) 기준으로 계산하기
 #    -> 배포 서버의 시계가 한국 시간이 아닐 수 있으므로,
 #       무조건 Asia/Seoul 시간대를 기준으로 계산해야 합니다.
+#    -> 오늘 건 아직 집계 전이라, 달력에서 고를 수 있는
+#       가장 늦은 날짜는 '어제'까지로 제한합니다.
 # -----------------------------
-def get_yesterday_kst() -> str:
+def get_yesterday_kst_date():
     now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
-    yesterday_kst = now_kst - timedelta(days=1)
-    return yesterday_kst.strftime("%Y%m%d")  # KOBIS가 원하는 형식: yyyymmdd (8자리)
+    return (now_kst - timedelta(days=1)).date()
 
 
 # -----------------------------
@@ -67,13 +68,23 @@ if not api_key:
 
 
 # -----------------------------
-# 5. 조회할 날짜(어제) 계산
+# 5. 조회할 날짜 고르기 (달력)
+#    -> 고를 수 있는 가장 늦은 날짜는 '어제'까지입니다. (오늘 건 아직 집계 전)
 # -----------------------------
-target_dt = get_yesterday_kst()
-target_dt_pretty = f"{target_dt[0:4]}년 {target_dt[4:6]}월 {target_dt[6:8]}일"
+st.title("🎬 날짜별 박스오피스")
 
-st.title("🎬 어제의 박스오피스")
-st.caption(f"조회 날짜: {target_dt_pretty} (한국 시간 기준 어제)")
+max_date = get_yesterday_kst_date()
+
+selected_date = st.date_input(
+    "조회할 날짜를 선택하세요",
+    value=max_date,       # 처음 열었을 때는 어제 날짜가 기본으로 선택됨
+    max_value=max_date,   # 오늘/미래 날짜는 선택할 수 없음
+)
+
+target_dt = selected_date.strftime("%Y%m%d")  # KOBIS가 원하는 형식: yyyymmdd (8자리)
+target_dt_pretty = selected_date.strftime("%Y년 %m월 %d일")
+
+st.caption(f"조회 날짜: {target_dt_pretty}")
 
 
 # -----------------------------
@@ -106,9 +117,8 @@ movie_list = box_office_result.get("dailyBoxOfficeList", [])
 
 if not movie_list:
     st.warning(
-        f"{target_dt_pretty} 박스오피스 데이터가 비어 있습니다.\n"
-        "해당 날짜의 집계가 아직 완료되지 않았거나, KOBIS 서버 점검 중일 수 있어요.\n"
-        "잠시 후 다시 시도해주세요."
+        f"{target_dt_pretty} : 그날은 아직 집계 전입니다.\n"
+        "(다른 날짜를 선택해보시거나, 잠시 후 다시 시도해주세요.)"
     )
     st.stop()
 
@@ -136,7 +146,7 @@ top_movie = df.iloc[0]
 st.subheader(f"🥇 1위 - {top_movie['movieNm']}")
 
 card1, card2, card3 = st.columns(3)
-card1.metric("어제 관객수", f"{int(top_movie['audiCnt']):,}명")
+card1.metric("그날 관객수", f"{int(top_movie['audiCnt']):,}명")
 card2.metric("누적 관객수", f"{int(top_movie['audiAcc']):,}명")
 card3.metric("스크린수", f"{int(top_movie['scrnCnt']):,}개")
 
@@ -145,14 +155,46 @@ st.divider()
 
 # -----------------------------
 # 9. 전체 순위 표
-#    -> 요청하신 6개 항목만 골라서, 한글 이름으로 바꿔 보여줍니다.
+#    -> 요청하신 6개 항목을 한글 이름으로 바꿔 보여줍니다.
+#    -> rankInten(전날 대비 순위 증감)이 양수면 빨간 위 화살표(▲),
+#       음수면 파란 아래 화살표(▼)를 순위 옆에 붙입니다.
+#    -> 누적관객수(audiAcc)가 100만 명을 넘으면 영화명 옆에 🏆을 붙입니다.
+#    -> 색깔 있는 화살표는 st.dataframe으로는 표현이 어려워서,
+#       직접 HTML 표를 만들어 st.markdown으로 보여줍니다.
 # -----------------------------
 st.subheader("📋 전체 순위")
 
-table_df = df[["rank", "movieNm", "openDt", "audiCnt", "audiAcc", "scrnCnt"]].copy()
-table_df.columns = ["순위", "영화명", "개봉일", "관객수", "누적관객수", "스크린수"]
+MILLION = 1_000_000  # 100만 명 기준값
 
-st.dataframe(table_df, use_container_width=True, hide_index=True)
+
+def format_rank_change(inten: int) -> str:
+    if pd.isna(inten) or inten == 0:
+        return "-"
+    if inten > 0:
+        return f'<span style="color:red;">▲{int(inten)}</span>'
+    return f'<span style="color:blue;">▼{abs(int(inten))}</span>'
+
+
+def format_movie_name(name: str, audi_acc) -> str:
+    if pd.notna(audi_acc) and audi_acc >= MILLION:
+        return f"{name} 🏆"
+    return name
+
+
+table_df = df[["rank", "rankInten", "movieNm", "openDt", "audiCnt", "audiAcc", "scrnCnt"]].copy()
+table_df["순위변동"] = table_df["rankInten"].apply(format_rank_change)
+table_df["영화명"] = table_df.apply(lambda row: format_movie_name(row["movieNm"], row["audiAcc"]), axis=1)
+table_df["관객수"] = table_df["audiCnt"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "-")
+table_df["누적관객수"] = table_df["audiAcc"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "-")
+table_df["스크린수"] = table_df["scrnCnt"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "-")
+table_df["순위"] = table_df["rank"].apply(lambda v: int(v) if pd.notna(v) else "-")
+table_df["개봉일"] = table_df["openDt"]
+
+table_df = table_df[["순위", "순위변동", "영화명", "개봉일", "관객수", "누적관객수", "스크린수"]]
+
+# to_html(escape=False)로 만들어야 위에서 넣은 <span> 태그(색깔)가 그대로 적용됩니다.
+html_table = table_df.to_html(escape=False, index=False)
+st.markdown(html_table, unsafe_allow_html=True)
 
 st.divider()
 
